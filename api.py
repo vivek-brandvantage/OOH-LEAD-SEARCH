@@ -22,14 +22,9 @@ class SearchRequest(BaseModel):
     center_point: str
     business_types: List[str]
     radius_meters: float
-
 class Business(BaseModel):
     name: str
     business_type: str
-    lat: float
-    lng: float
-    rating: Optional[float]
-    reviews: Optional[int]
     phone: Optional[str]
     website: Optional[str]
     maps_url: Optional[str]
@@ -121,29 +116,21 @@ async def search_sheets(req: SearchRequest):
                 all_results.append(Business(
                     name=p.get("name"),
                     business_type=btype,
-                    lat=loc["lat"],
-                    lng=loc["lng"],
-                    rating=p.get("rating"),
-                    reviews=p.get("user_ratings_total"),
                     phone=detail.get("formatted_phone_number"),
                     website=detail.get("website"),
                     maps_url=detail.get("url"),
                 ))
 
-    # 🔥 sort + limit
-    all_results.sort(key=lambda x: x.rating or 0, reverse=True)
-    all_results = all_results[:30]
+              
 
-    # 🔥 convert to sheet-friendly rows
+   
+    all_results.sort(key=lambda x: x.name)
+    #  convert to sheet-friendly rows
     rows = []
     for b in all_results:
         rows.append({
             "name": b.name,
             "type": b.business_type,
-            "lat": b.lat,
-            "lng": b.lng,
-            "rating": b.rating,
-            "reviews": b.reviews,
             "phone": b.phone,
             "website": b.website,
             "maps_url": b.maps_url
