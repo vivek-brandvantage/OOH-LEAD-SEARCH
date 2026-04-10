@@ -1,9 +1,9 @@
-import math
 import os
 import asyncio
 from typing import List, Optional
 import io
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import openpyxl
 
 import httpx
@@ -20,11 +20,21 @@ GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 # ── APP ─────────────────────────────────────────────
 app = FastAPI(title="OOH Business Finder (Sheets Ready)")
 
+# ── CORS ─────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ── MODELS ──────────────────────────────────────────
 class SearchRequest(BaseModel):
     center_point: str
     business_types: List[str]
     radius_meters: float
+
 class Business(BaseModel):
     name: str
     business_type: str
@@ -33,6 +43,7 @@ class Business(BaseModel):
     phone: Optional[str]
     website: Optional[str]
     maps_url: Optional[str]
+
 # ── HELPERS ─────────────────────────────────────────
 async def geocode(address: str):
     if not GOOGLE_API_KEY:
@@ -96,7 +107,13 @@ async def search_places(lat, lng, radius, keyword):
     return results
 
 
-# ── MAIN ENDPOINT ───────────────────────────────────
+# ── HEALTH ──────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ── SEARCH ENDPOINT ─────────────────────────────────
 @app.post("/search_sheets")
 async def search_sheets(req: SearchRequest):
     lat, lng = await geocode(req.center_point)
@@ -114,7 +131,6 @@ async def search_sheets(req: SearchRequest):
                 seen.add(p["place_id"])
 
                 loc = p["geometry"]["location"]
-
                 detail = await get_details(p["place_id"], client)
 
                 all_results.append(Business(
@@ -126,11 +142,9 @@ async def search_sheets(req: SearchRequest):
                     website=detail.get("website"),
                     maps_url=detail.get("url"),
                 ))
-              
 
-   
     all_results.sort(key=lambda x: x.name)
-    #  convert to sheet-friendly rows
+
     rows = []
     for b in all_results:
         rows.append({
@@ -147,13 +161,11 @@ async def search_sheets(req: SearchRequest):
     }
 
 
-# ── HEALTH ──────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# ── EXCEL DOWNLOAD ──────────────────────────────────
 @app.post("/excel_download")
 async def excel_download(req: SearchRequest):
-    data = await map_view(req)
+    # FIX: was calling map_view() which has no phone/website — now calls search_sheets()
+    data = await search_sheets(req)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -181,9 +193,10 @@ async def excel_download(req: SearchRequest):
         headers={"Content-Disposition": "attachment; filename=businesses.xlsx"}
     )
 
+
+# ── MAP ENDPOINT ────────────────────────────────────
 @app.post("/map")
 async def map_view(req: SearchRequest):
-    # 1. Get center coordinates
     lat, lng = await geocode(req.center_point)
 
     seen = set()
@@ -199,15 +212,11 @@ async def map_view(req: SearchRequest):
                 seen.add(p["place_id"])
 
                 loc = p["geometry"]["location"]
-
                 results.append({
                     "name": p.get("name"),
                     "lat": loc["lat"],
                     "lng": loc["lng"]
                 })
-
-    # Optional: limit for performance
-    results = results
 
     return {
         "center": {
