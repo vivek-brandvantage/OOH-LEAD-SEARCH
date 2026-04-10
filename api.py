@@ -2,6 +2,9 @@ import math
 import os
 import asyncio
 from typing import List, Optional
+import io
+from fastapi.responses import StreamingResponse
+import openpyxl
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -25,10 +28,11 @@ class SearchRequest(BaseModel):
 class Business(BaseModel):
     name: str
     business_type: str
+    lat: float
+    lng: float
     phone: Optional[str]
     website: Optional[str]
     maps_url: Optional[str]
-
 # ── HELPERS ─────────────────────────────────────────
 async def geocode(address: str):
     if not GOOGLE_API_KEY:
@@ -116,11 +120,12 @@ async def search_sheets(req: SearchRequest):
                 all_results.append(Business(
                     name=p.get("name"),
                     business_type=btype,
+                    lat=loc["lat"],
+                    lng=loc["lng"],
                     phone=detail.get("formatted_phone_number"),
                     website=detail.get("website"),
                     maps_url=detail.get("url"),
                 ))
-
               
 
    
@@ -146,3 +151,69 @@ async def search_sheets(req: SearchRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+@app.post("/excel_download")
+async def excel_download(req: SearchRequest):
+    data = await map_view(req)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Businesses"
+
+    headers = ["Name", "Type", "Phone", "Website", "Maps URL"]
+    ws.append(headers)
+
+    for b in data["rows"]:
+        ws.append([
+            b["name"],
+            b["type"],
+            b["phone"],
+            b["website"],
+            b["maps_url"]
+        ])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=businesses.xlsx"}
+    )
+
+@app.post("/map")
+async def map_view(req: SearchRequest):
+    # 1. Get center coordinates
+    lat, lng = await geocode(req.center_point)
+
+    seen = set()
+    results = []
+
+    async with httpx.AsyncClient() as client:
+        for btype in req.business_types:
+            places = await search_places(lat, lng, req.radius_meters, btype)
+
+            for p in places:
+                if p["place_id"] in seen:
+                    continue
+                seen.add(p["place_id"])
+
+                loc = p["geometry"]["location"]
+
+                results.append({
+                    "name": p.get("name"),
+                    "lat": loc["lat"],
+                    "lng": loc["lng"]
+                })
+
+    # Optional: limit for performance
+    results = results
+
+    return {
+        "center": {
+            "lat": lat,
+            "lng": lng
+        },
+        "radius": req.radius_meters,
+        "rows": results
+    }
