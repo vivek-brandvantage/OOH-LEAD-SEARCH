@@ -21,7 +21,7 @@ PLACES_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
-# ── SCRAPER HEADERS (mimic a real browser so sites don't block us) ───────────
+# ── SCRAPER HEADERS ─────────────────────────────────
 SCRAPER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -33,12 +33,14 @@ SCRAPER_HEADERS = {
 }
 
 # ── APP ─────────────────────────────────────────────
-app = FastAPI(title="OOH Business Finder (Sheets Ready)")
+app = FastAPI(title="OOH Business Finder")
+
+origins=["https://ooh-frontend-lead.vercel.app/"]
 
 # ── CORS ─────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,46 +63,107 @@ class Business(BaseModel):
     running_google_ads: str = "No"
     running_facebook_ads: str = "No"
 
-# ── ADS DETECTION ────────────────────────────────────────────────────────────
-#
-# Strategy: fetch only the raw HTML (no JS execution), parse the <head> with
-# BeautifulSoup, then regex-scan every <script> src and inline content.
-#
-# Google Ads signals (any one = Yes):
-#   • googleads.g.doubleclick.net          ← conversion pixel (strongest signal)
-#   • gtag/js?id=AW-XXXXXXXXX              ← Google Ads tag via gtag
-#   • googleadservices.com                 ← ad serving domain
-#   • gtag("config", "AW-...)              ← inline gtag config for Ads
-#
-# Facebook Ads signals (any one = Yes):
-#   • connect.facebook.net/fbevents.js     ← FB pixel script src
-#   • fbq("init", "...")                   ← inline pixel init call
-#   • facebook.com/tr?id=                  ← noscript img pixel fallback
-
-GOOGLE_ADS_PATTERNS = [
-    r"googleads\.g\.doubleclick\.net",          # conversion pixel src
-    r"googletagmanager\.com/gtag/js\?id=AW-",   # AW- tag via GTM
-    r"googleadservices\.com",                    # ad serving domain
-    r"""gtag\s*\(\s*['"]config['"]\s*,\s*['"]AW-""",  # inline gtag config
+# ── WEBSITE VALIDATOR ────────────────────────────────
+SOCIAL_DOMAINS = [
+    "facebook.com",
+    "instagram.com",
+    "x.com",
+    "tiktok.com",
 ]
 
-FACEBOOK_ADS_PATTERNS = [
-    r"connect\.facebook\.net/[^/]+/fbevents\.js",  # pixel script src
-    r"""fbq\s*\(\s*['"]init['"]""",                 # inline fbq init
-    r"facebook\.com/tr\?id=",                       # noscript img pixel
-]
+def validate_website(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+
+    url = url.lower()
+
+    if any(domain in url for domain in SOCIAL_DOMAINS):
+        return None  # ignore social links
+
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    return url
+
+# ── ADS DETECTION ───────────────────────────────────
+# Patterns are compiled ONCE at import time into a single alternation regex
+# per role — the engine performs exactly ONE pass instead of N separate searches.
+# Tag Assistant works the same way: it checks <script src=""> against a known
+# URL allowlist, then falls back to inline body inspection.
+
+# ─ Pre-compiled combined regexes ────────────────────────────────────────────
+
+# Google Ads: <script async src="…"> CDN URL signatures
+_G_SRC = re.compile(
+    r"googletagmanager\.com/(?:gtag/js|gtm\.js)"
+    r"|pagead2\.googlesyndication\.com/pagead/js"
+    r"|googleadservices\.com/pagead/conversion"
+    r"|google-analytics\.com/(?:analytics|gtag)",
+    re.IGNORECASE,
+)
+
+# Google Ads: inline <script> body (gtag config call or bare AW- / G- / GTM- ID)
+_G_INLINE = re.compile(
+    r"gtag\s*\(\s*['\"]config['\"]"
+    r"|AW-\d+"
+    r"|GTM-[A-Z0-9]+"
+    r"|G-[A-Z0-9]+",
+    re.IGNORECASE,
+)
+
+# Facebook Pixel: <script async src="…"> CDN URL
+# One alternation covers both fbevents.js and all.js bundles, accommodating varying paths
+_FB_SRC = re.compile(
+    r"connect\.facebook\.net/.*?/(?:fbevents|all)\.js",
+    re.IGNORECASE,
+)
+
+# Facebook Pixel: inline fbq('init',…) call or noscript pixel <img>
+_FB_INLINE = re.compile(
+    r"fbq\s*\(\s*['\"]init['\"]"
+    r"|fbq\s*\(\s*['\"]track['\"]"
+    r"|facebook\.com/tr\?id=",
+    re.IGNORECASE,
+)
+
+# Only decode the first 150 KB of each page.
+# Google/Facebook tags always live in <head> — the rest of the page is waste.
+_MAX_HTML_BYTES = 150_000
+
+
+def _detect_from_script_tags(soup: BeautifulSoup) -> tuple[bool, bool]:
+    """
+    Primary layer — Tag Assistant style:
+    Walk every <script> tag once using a lazy generator.
+    • src attribute  → checked with pre-compiled CDN regex (single pass).
+    • inline body    → only decoded when at least one platform is still unresolved.
+    Exits as soon as both platforms are confirmed.
+    """
+    g = fb = False
+
+    for tag in soup.find_all("script"):        # generator, not a list
+        src = tag.get("src") or ""
+        if src:
+            if not g  and _G_SRC.search(src):  g  = True
+            if not fb and _FB_SRC.search(src): fb = True
+
+        # Skip body decode when both already confirmed
+        if not g or not fb:
+            body = tag.string or ""
+            if body:
+                if not g  and _G_INLINE.search(body):  g  = True
+                if not fb and _FB_INLINE.search(body): fb = True
+
+        if g and fb:
+            break   # early exit — no need to walk remaining tags
+
+    return g, fb
+
 
 async def detect_ads(website: Optional[str], client: httpx.AsyncClient) -> tuple[str, str]:
-    """
-    Fetches the website's raw HTML, parses only the <head> section with
-    BeautifulSoup, and checks for Google Ads / Facebook Ads signals.
-
-    Returns: ("Yes"/"No", "Yes"/"No")  →  (google_ads, facebook_ads)
-    """
     if not website:
         return "No", "No"
 
-    # Normalize — ensure scheme is present
     url = website if website.startswith("http") else f"https://{website}"
 
     try:
@@ -110,27 +173,29 @@ async def detect_ads(website: Optional[str], client: httpx.AsyncClient) -> tuple
             timeout=10,
             follow_redirects=True,
         )
-        html = resp.text
+        # Slice raw bytes BEFORE decode — avoids allocating a multi-MB Python str.
+        # Ad tags live in <head>; 150 KB captures all of them on any real site.
+        raw = resp.content[:_MAX_HTML_BYTES].decode("utf-8", errors="replace")
     except Exception:
-        # Network error, timeout, SSL issue — skip silently
         return "No", "No"
 
-    # Parse only the <head> tag to keep things fast; fall back to full HTML
-    soup = BeautifulSoup(html, "html.parser")
-    head = soup.find("head")
-    head_html = str(head) if head else html  # raw string for regex scanning
+    soup = BeautifulSoup(raw, "html.parser")
 
-    google_ads = _match_any(head_html, GOOGLE_ADS_PATTERNS)
-    facebook_ads = _match_any(head_html, FACEBOOK_ADS_PATTERNS)
+    # Layer 1: structured tag walk (Tag Assistant style)
+    g, fb = _detect_from_script_tags(soup)
 
-    return (
-        "Yes" if google_ads else "No",
-        "Yes" if facebook_ads else "No",
-    )
+    # Layer 2: raw-text fallback (handles GTM-injected / obfuscated / lazy scripts)
+    if not g:  g  = bool(_G_SRC.search(raw)  or _G_INLINE.search(raw))
+    if not fb: fb = bool(_FB_SRC.search(raw) or _FB_INLINE.search(raw))
+
+    # Explicit cleanup — frees the parsed tree and raw string before the
+    # coroutine yields back to the event loop, keeping per-request heap low.
+    del soup, raw
+
+    return ("Yes" if g else "No", "Yes" if fb else "No")
 
 
-def _match_any(text: str, patterns: list[str]) -> bool:
-    return any(re.search(pat, text, re.IGNORECASE) for pat in patterns)
+
 
 
 # ── HELPERS ─────────────────────────────────────────
@@ -151,7 +216,6 @@ async def geocode(address: str):
     loc = data["results"][0]["geometry"]["location"]
     return loc["lat"], loc["lng"]
 
-
 async def get_details(place_id: str, client):
     try:
         r = await client.get(DETAILS_URL, params={
@@ -165,7 +229,6 @@ async def get_details(place_id: str, client):
     except:
         pass
     return {}
-
 
 async def search_places(lat, lng, radius, keyword):
     results = []
@@ -195,12 +258,10 @@ async def search_places(lat, lng, radius, keyword):
 
     return results
 
-
 # ── HEALTH ──────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 # ── SEARCH ENDPOINT ─────────────────────────────────
 @app.post("/search_sheets")
@@ -210,7 +271,6 @@ async def search_sheets(req: SearchRequest):
     seen = set()
     all_results = []
 
-    # One shared client for Places details + ads scraping (connection pooling)
     async with httpx.AsyncClient() as client:
         for btype in req.business_types:
             places = await search_places(lat, lng, req.radius_meters, btype)
@@ -222,9 +282,10 @@ async def search_sheets(req: SearchRequest):
 
                 loc = p["geometry"]["location"]
                 detail = await get_details(p["place_id"], client)
-                website = detail.get("website")
 
-                # ── Ads detection (async, non-blocking) ──────────────────────
+                raw_website = detail.get("website")
+                website = validate_website(raw_website)
+
                 google_ads, facebook_ads = await detect_ads(website, client)
 
                 all_results.append(Business(
@@ -258,7 +319,6 @@ async def search_sheets(req: SearchRequest):
         "rows": rows
     }
 
-
 # ── EXCEL DOWNLOAD ──────────────────────────────────
 @app.post("/excel_download")
 async def excel_download(req: SearchRequest):
@@ -291,7 +351,6 @@ async def excel_download(req: SearchRequest):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=businesses.xlsx"}
     )
-
 
 # ── MAP ENDPOINT ────────────────────────────────────
 @app.post("/map")
