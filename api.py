@@ -95,19 +95,13 @@ def validate_website(url: Optional[str]) -> Optional[str]:
 
 # Google Ads: <script async src="…"> CDN URL signatures
 _G_SRC = re.compile(
-    r"googletagmanager\.com/(?:gtag/js|gtm\.js)"
-    r"|pagead2\.googlesyndication\.com/pagead/js"
-    r"|googleadservices\.com/pagead/conversion"
-    r"|google-analytics\.com/(?:analytics|gtag)",
+    r"googletagmanager\.com/gtag/js\?id=AW-\d+",
     re.IGNORECASE,
 )
 
-# Google Ads: inline <script> body (gtag config call or bare AW- / G- / GTM- ID)
+# Google Ads: inline <script> body
 _G_INLINE = re.compile(
-    r"gtag\s*\(\s*['\"]config['\"]"
-    r"|AW-\d+"
-    r"|GTM-[A-Z0-9]+"
-    r"|G-[A-Z0-9]+",
+    r"AW-\d+",
     re.IGNORECASE,
 )
 
