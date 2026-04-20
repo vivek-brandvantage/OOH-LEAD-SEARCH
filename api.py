@@ -2,6 +2,7 @@ import os
 import asyncio
 import re
 from typing import List, Optional
+from urllib.parse import urlparse
 import io
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,9 @@ from pydantic import BaseModel
 # ── ENV ─────────────────────────────────────────────
 dotenv.load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+
+# Base URL for the adsapi.py service (adjust port/host as needed)
+ADS_API_URL = "https://lead-ads-api.onrender.com"
 
 PLACES_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
@@ -34,8 +38,6 @@ SCRAPER_HEADERS = {
 
 # ── APP ─────────────────────────────────────────────
 app = FastAPI(title="OOH Business Finder")
-
-# origins=["https://ooh-frontend-lead.vercel.app/"]
 
 # ── CORS ─────────────────────────────────────────────
 app.add_middleware(
@@ -60,8 +62,9 @@ class Business(BaseModel):
     phone: Optional[str]
     website: Optional[str]
     maps_url: Optional[str]
+    has_google_ads_tag: str = "No"
     running_google_ads: str = "No"
-    running_facebook_ads: str = "No"
+    has_facebook_tag: str = "No"
 
 # ── WEBSITE VALIDATOR ────────────────────────────────
 SOCIAL_DOMAINS = [
@@ -85,13 +88,28 @@ def validate_website(url: Optional[str]) -> Optional[str]:
 
     return url
 
+
+def extract_domain(url: Optional[str]) -> Optional[str]:
+    """
+    Parse out the bare domain from a URL, stripping www. prefix.
+    e.g. "https://www.example.com/page" → "example.com"
+    """
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url if url.startswith("http") else f"https://{url}")
+        host = parsed.netloc or parsed.path  # fallback if scheme was missing
+        host = host.split(":")[0]            # strip port if present
+        if host.startswith("www."):
+            host = host[4:]
+        return host.lower() if host else None
+    except Exception:
+        return None
+
+
 # ── ADS DETECTION ───────────────────────────────────
 # Patterns are compiled ONCE at import time into a single alternation regex
 # per role — the engine performs exactly ONE pass instead of N separate searches.
-# Tag Assistant works the same way: it checks <script src=""> against a known
-# URL allowlist, then falls back to inline body inspection.
-
-# ─ Pre-compiled combined regexes ────────────────────────────────────────────
 
 # Google Ads: <script async src="…"> CDN URL signatures
 _G_SRC = re.compile(
@@ -106,7 +124,6 @@ _G_INLINE = re.compile(
 )
 
 # Facebook Pixel: <script async src="…"> CDN URL
-# One alternation covers both fbevents.js and all.js bundles, accommodating varying paths
 _FB_SRC = re.compile(
     r"connect\.facebook\.net/.*?/(?:fbevents|all)\.js",
     re.IGNORECASE,
@@ -121,7 +138,6 @@ _FB_INLINE = re.compile(
 )
 
 # Only decode the first 150 KB of each page.
-# Google/Facebook tags always live in <head> — the rest of the page is waste.
 _MAX_HTML_BYTES = 150_000
 
 
@@ -135,13 +151,12 @@ def _detect_from_script_tags(soup: BeautifulSoup) -> tuple[bool, bool]:
     """
     g = fb = False
 
-    for tag in soup.find_all("script"):        # generator, not a list
+    for tag in soup.find_all("script"):
         src = tag.get("src") or ""
         if src:
             if not g  and _G_SRC.search(src):  g  = True
             if not fb and _FB_SRC.search(src): fb = True
 
-        # Skip body decode when both already confirmed
         if not g or not fb:
             body = tag.string or ""
             if body:
@@ -149,14 +164,37 @@ def _detect_from_script_tags(soup: BeautifulSoup) -> tuple[bool, bool]:
                 if not fb and _FB_INLINE.search(body): fb = True
 
         if g and fb:
-            break   # early exit — no need to walk remaining tags
+            break
 
     return g, fb
 
 
-async def detect_ads(website: Optional[str], client: httpx.AsyncClient) -> tuple[str, str]:
+async def check_active_google_ads(domain: str, client: httpx.AsyncClient) -> bool:
+    """
+    Hit adsapi.py's /check_ads_status to confirm the domain is actively
+    running Google Ads in the Ads Transparency centre.
+    Returns True if active ads are found, False otherwise (including on errors).
+    """
+    try:
+        resp = await client.post(
+            f"{ADS_API_URL}/check_ads_status",
+            json={"domain": domain, "region": "AU"},
+            timeout=30,          # Playwright needs extra time
+        )
+        if resp.status_code == 200:
+            return resp.json().get("has_ads", "no").lower() == "yes"
+    except Exception:
+        pass
+    return False
+
+
+async def detect_ads(website, client):
+    # Returns (has_google_ads_tag, running_google_ads, has_facebook_tag)
+    # has_google_ads_tag  — tag/AW- ID present on the page
+    # running_google_ads  — tag present AND adsapi confirms active ads
+    # has_facebook_tag    — Facebook Pixel present on the page
     if not website:
-        return "No", "No"
+        return "No", "No", "No"
 
     url = website if website.startswith("http") else f"https://{website}"
 
@@ -167,11 +205,9 @@ async def detect_ads(website: Optional[str], client: httpx.AsyncClient) -> tuple
             timeout=10,
             follow_redirects=True,
         )
-        # Slice raw bytes BEFORE decode — avoids allocating a multi-MB Python str.
-        # Ad tags live in <head>; 150 KB captures all of them on any real site.
         raw = resp.content[:_MAX_HTML_BYTES].decode("utf-8", errors="replace")
     except Exception:
-        return "No", "No"
+        return "No", "No", "No"
 
     soup = BeautifulSoup(raw, "html.parser")
 
@@ -182,14 +218,17 @@ async def detect_ads(website: Optional[str], client: httpx.AsyncClient) -> tuple
     if not g:  g  = bool(_G_SRC.search(raw)  or _G_INLINE.search(raw))
     if not fb: fb = bool(_FB_SRC.search(raw) or _FB_INLINE.search(raw))
 
-    # Explicit cleanup — frees the parsed tree and raw string before the
-    # coroutine yields back to the event loop, keeping per-request heap low.
     del soup, raw
 
-    return ("Yes" if g else "No", "Yes" if fb else "No")
+    # Only hit adsapi when the Google tag is actually present — skip otherwise
+    running_google = "No"
+    if g:
+        domain = extract_domain(website)
+        if domain:
+            is_active = await check_active_google_ads(domain, client)
+            running_google = "Yes" if is_active else "No"
 
-
-
+    return ("Yes" if g else "No", running_google, "Yes" if fb else "No")
 
 
 # ── HELPERS ─────────────────────────────────────────
@@ -280,7 +319,7 @@ async def search_sheets(req: SearchRequest):
                 raw_website = detail.get("website")
                 website = validate_website(raw_website)
 
-                google_ads, facebook_ads = await detect_ads(website, client)
+                has_g_tag, running_google, has_fb_tag = await detect_ads(website, client)
 
                 all_results.append(Business(
                     name=p.get("name"),
@@ -290,8 +329,9 @@ async def search_sheets(req: SearchRequest):
                     phone=detail.get("formatted_phone_number"),
                     website=website,
                     maps_url=detail.get("url"),
-                    running_google_ads=google_ads,
-                    running_facebook_ads=facebook_ads,
+                    has_google_ads_tag=has_g_tag,
+                    running_google_ads=running_google,
+                    has_facebook_tag=has_fb_tag,
                 ))
 
     all_results.sort(key=lambda x: x.name)
@@ -304,8 +344,9 @@ async def search_sheets(req: SearchRequest):
             "phone": b.phone,
             "website": b.website,
             "maps_url": b.maps_url,
+            "has_google_ads_tag": b.has_google_ads_tag,
             "running_google_ads": b.running_google_ads,
-            "running_facebook_ads": b.running_facebook_ads,
+            "has_facebook_tag": b.has_facebook_tag,
         })
 
     return {
@@ -322,7 +363,7 @@ async def excel_download(req: SearchRequest):
     ws = wb.active
     ws.title = "Businesses"
 
-    headers = ["Name", "Type", "Phone", "Website", "Maps URL", "Running Google Ads", "Running Facebook Ads"]
+    headers = ["Name", "Type", "Phone", "Website", "Maps URL", "Has Google Ads Tag", "Running Google Ads", "Has Facebook Tag"]
     ws.append(headers)
 
     for b in data["rows"]:
@@ -332,8 +373,9 @@ async def excel_download(req: SearchRequest):
             b["phone"],
             b["website"],
             b["maps_url"],
+            b["has_google_ads_tag"],
             b["running_google_ads"],
-            b["running_facebook_ads"],
+            b["has_facebook_tag"],
         ])
 
     buffer = io.BytesIO()
